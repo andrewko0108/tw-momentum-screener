@@ -127,33 +127,67 @@ class History:
         self.rows_loaded += 1
 
 
-def scan_archive_zip(history, path, as_of):
+def scan_archive_zip(history, path, as_of, year=None):
+    """Read both the source's merged yearly_YYYY.csv / weekly_YYYY_Www.csv
+    and legacy per-day YYYYMMDD.csv ZIP contents.
+
+    The upstream packager merges all daily CSVs into ONE CSV before zipping;
+    checking only YYYYMMDD.csv member names silently discards all history.
+    """
     n = 0
+    upper = date.fromisoformat(as_of)
     with zipfile.ZipFile(path) as zf:
-        names = []
-        for member in zf.namelist():
-            if member.lower().endswith(".csv") and not member.endswith("/"):
-                # YYYYMMDD.csv, YYYY-MM-DD.csv, or prefix folders
-                match = re.search(r"(20\d{2}[-]?\d{2}[-]?\d{2})\.csv$", member)
-                if match:
-                    try:
-                        day = iso_date(match.group(1))
-                        if day <= as_of:
-                            names.append((day, member))
-                    except ValueError:
-                        pass
-        for day, member in sorted(names):
+        members = [x for x in zf.namelist() if x.lower().endswith('.csv') and not x.endswith('/')]
+        if not members:
+            raise RuntimeError(f"{path.name}: ZIP contains no CSV files")
+        # Common source format has exactly one chronological, date-sorted CSV.
+        for member in sorted(members):
+            m = re.search(r"(20\d{2}[-]?\d{2}[-]?\d{2})\.csv$", member)
+            fallback = iso_date(m.group(1)) if m else None
             with zf.open(member) as f:
-                stream = io.TextIOWrapper(f, encoding="utf-8-sig", errors="replace", newline="")
-                for r in csv.DictReader(stream):
-                    if not r or not r.get("code"):
+                stream = io.TextIOWrapper(f, encoding='utf-8-sig', errors='replace', newline='')
+                reader = csv.DictReader(stream)
+                if not reader.fieldnames or 'code' not in reader.fieldnames:
+                    raise RuntimeError(f"{path.name}/{member}: missing 'code' column; found {reader.fieldnames}")
+                if 'date' not in reader.fieldnames and fallback is None:
+                    raise RuntimeError(f"{path.name}/{member}: merged CSV is missing the 'date' column")
+                for r in reader:
+                    if not r or not r.get('code'):
                         continue
-                    r.setdefault("date", day)
-                    normalized = normalize(r)
-                    if normalized and normalized["date"] <= as_of:
-                        history.insert(normalized)
+                    if not r.get('date') and fallback is not None:
+                        r['date'] = fallback
+                    item = normalize(r)
+                    if item is None:
+                        continue
+                    d = date.fromisoformat(item['date'])
+                    # ISO weeks around New Year overlap adjacent calendar years;
+                    # insert only the calendar year currently being loaded.
+                    if year is not None and d.year != year:
+                        continue
+                    if d <= upper:
+                        history.insert(item)
                         n += 1
     return n
+
+
+def weeks_intersecting_year(assets, year, upper):
+    """Find released ISO-week ZIPs overlapping the specified calendar year."""
+    result = []
+    begin = date(year, 1, 1)
+    end = min(date(year, 12, 31), date.fromisoformat(upper))
+    if end < begin:
+        return result
+    for name in assets:
+        m = re.fullmatch(r"weekly_(\d{4})_W(\d{2})\.zip", name)
+        if not m:
+            continue
+        try:
+            monday = date.fromisocalendar(int(m.group(1)), int(m.group(2)), 1)
+        except ValueError:
+            continue
+        if monday <= end and monday + timedelta(days=6) >= begin:
+            result.append((monday, name))
+    return [name for _, name in sorted(result)]
 
 
 def scan_csv(history, path, as_of):
@@ -180,36 +214,62 @@ def download_archives(history, cache_dir, as_of, start_year, force_current=True,
     resp = s.get(RELEASE_API, timeout=45)
     resp.raise_for_status()
     payload = resp.json()
-    assets = {x["name"]: x["browser_download_url"] for x in payload.get("assets", [])}
+    assets = {x['name']: x['browser_download_url'] for x in payload.get('assets', [])}
     if not assets:
-        raise RuntimeError("GitHub Release has no assets. Check release and permissions.")
-    count = 0
+        raise RuntimeError('GitHub Release has no assets. Check release and permissions.')
+
+    upper = archive_end or as_of
+    end_year = int(as_of[:4])
     missing_years = []
-    for year in range(start_year, int(as_of[:4]) + 1):
-        name = f"yearly_{year}.zip"
-        if name not in assets:
+    count = 0
+    for year in range(start_year, end_year + 1):
+        annual = f'yearly_{year}.zip'
+        if annual in assets:
+            filenames = [annual]
+        else:
+            filenames = weeks_intersecting_year(assets, year, upper)
+        if not filenames:
             missing_years.append(year)
             continue
-        file = cache_dir / name
-        if not file.exists() or (force_current and year == int(as_of[:4])):
-            print(f"Downloading {name}...", flush=True)
-            with s.get(assets[name], timeout=180, stream=True) as r:
-                r.raise_for_status()
-                temp = file.with_suffix(".zip.part")
-                with temp.open("wb") as out:
-                    for chunk in r.iter_content(chunk_size=1024 * 256):
-                        if chunk:
-                            out.write(chunk)
-                if not zipfile.is_zipfile(temp):
-                    temp.unlink(missing_ok=True)
-                    raise ValueError(f"Broken archive: {name}")
-                temp.replace(file)
-        count += scan_archive_zip(history, file, archive_end or as_of)
-        print(f"  {year}: {count:,} accumulated stock-date rows", flush=True)
+        year_rows = 0
+        for name in filenames:
+            file = cache_dir / name
+            # An annual archive is fixed after that calendar year. Weekly files
+            # are also fixed once their release has settled; refetch active
+            # current weeks so corrections can be picked up.
+            refresh = (force_current and year == end_year and
+                       (name == annual or name == filenames[-1]))
+            if not file.exists() or refresh:
+                print(f'Downloading {name}...', flush=True)
+                with s.get(assets[name], timeout=180, stream=True) as r:
+                    r.raise_for_status()
+                    temp = file.with_suffix('.zip.part')
+                    with temp.open('wb') as out:
+                        for chunk in r.iter_content(chunk_size=1024 * 256):
+                            if chunk:
+                                out.write(chunk)
+                    if not zipfile.is_zipfile(temp):
+                        temp.unlink(missing_ok=True)
+                        raise ValueError(f'Broken archive: {name}')
+                    temp.replace(file)
+            rows = scan_archive_zip(history, file, upper, year=year)
+            # A particular weekly archive can contain ONLY days after the
+            # official backfill cutoff. Zero records in that case is expected.
+            if name == annual and rows == 0:
+                raise RuntimeError(f'{name}: 0 valid stock-date records after parsing; check CSV schema')
+            year_rows += rows
+            count += rows
+        if year_rows == 0:
+            # Current-year weekly releases can be all newer than the cutoff
+            # only for extremely early January; ordinarily this is a bug.
+            raise RuntimeError(f'{year}: 0 valid stock-date records; check weekly archives and CSV schema')
+        print(f'  {year}: {year_rows:,} rows ({len(filenames)} archives); total {count:,}', flush=True)
     if missing_years:
-        warnings.warn(f"Historical years missing from release: {missing_years}. ATH is not verifiable if history is incomplete.")
-    if int(as_of[:4]) in missing_years:
-        raise RuntimeError("Current-year historical archive missing; refuse incomplete screening.")
+        warnings.warn(f'Historical years missing from release: {missing_years}. ATH is not verifiable if history is incomplete.')
+    if end_year in missing_years:
+        raise RuntimeError('Current-year historical archive missing (no annual or weekly ZIPs); refuse incomplete screening.')
+    if count == 0:
+        raise RuntimeError('No OHLCV history was parsed; refuse incomplete screening.')
     return count, missing_years
 
 
