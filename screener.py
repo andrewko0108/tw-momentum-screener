@@ -290,11 +290,25 @@ def official_snapshot(s, url, market):
 
 
 def fetch_official_latest_pair():
+    """Get aligned latest sessions; OpenAPI TWSE may lag the market close."""
     s = session()
     twse, a = official_snapshot(s, TWSE_API, "上市")
     tpex, b = official_snapshot(s, TPEX_API, "上櫃")
+    if a < b:
+        # TWSE's latest-only OpenAPI can publish later than its dated MI_INDEX.
+        twse = historical_twse(s, b)
+        if len(twse) < 100:
+            raise RuntimeError(f"TWSE OpenAPI is still at {a}; dated MI_INDEX for {b} has only {len(twse)} stocks")
+        a = b
+        print(f"TWSE latest OpenAPI lag detected; switched to dated MI_INDEX {a}", flush=True)
+    elif b < a:
+        tpex = historical_tpex(s, a)
+        if len(tpex) < 100:
+            raise RuntimeError(f"TPEx OpenAPI is still at {b}; dated dailyQuotes for {a} has only {len(tpex)} stocks")
+        b = a
+        print(f"TPEx latest OpenAPI lag detected; switched to dated dailyQuotes {b}", flush=True)
     if a != b:
-        raise RuntimeError(f"Mismatch official dates: TWSE {a} vs TPEx {b}; fail closed")
+        raise RuntimeError(f"Official dates do not match: TWSE {a} vs TPEx {b}")
     return s, twse, tpex, a
 
 
@@ -305,6 +319,12 @@ def historical_twse(s, day):
                            "type": "ALLBUT0999"}, timeout=45)
     r.raise_for_status()
     data = r.json()
+    if not isinstance(data, dict):
+        raise RuntimeError(f"TWSE {day}: historical response was not an object")
+    if data.get("stat") == "OK":
+        source_date = data.get("date")
+        if not source_date or iso_date(source_date) != day:
+            raise RuntimeError(f"TWSE {day}: source date mismatch (returned {source_date!r})")
     tables = data.get("tables", [])
     if not tables:
         tables = [{"fields": data.get(f"fields{i}", []), "data": data.get(f"data{i}", [])} for i in range(1, 15)]
@@ -332,50 +352,95 @@ def historical_twse(s, day):
 
 
 def historical_tpex(s, day):
-    """Historic TPEx all-stock quote JSON, aaData[0:...] layout verified against documented schema."""
-    d = date.fromisoformat(day)
-    roc = f"{d.year - 1911}/{d.month:02d}/{d.day:02d}"
-    url = "https://www.tpex.org.tw/web/stock/aftertrading/otc_quotes_no1430/stk_wn1430_result.php"
-    r = s.get(url, params={"l": "zh-tw", "d": roc, "se": "EW"}, timeout=45)
+    """TPEx official dated dailyQuotes: tables/fields/data (NOT legacy aaData).
+
+    Validate source date and identify columns by their Chinese labels to avoid
+    treating the average PRICE column as trading VOLUME.
+    """
+    url = "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes"
+    r = s.get(url, params={"response": "json", "date": day.replace("-", "/")}, timeout=45)
     r.raise_for_status()
     payload = r.json()
-    if "aaData" not in payload:
-        raise RuntimeError(f"TPEx {day}: missing aaData")
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"TPEx {day}: JSON payload was not an object")
+    raw_date = payload.get("date") or payload.get("reportDate")
+    if not raw_date:
+        raise RuntimeError(f"TPEx {day}: response lacks a source date; refuse unverifiable data")
+    try:
+        observed_date = iso_date(raw_date)
+    except (ValueError, TypeError) as e:
+        raise RuntimeError(f"TPEx {day}: invalid source date {raw_date!r}") from e
+    if observed_date != day:
+        raise RuntimeError(f"TPEx {day}: source date mismatch (returned {observed_date})")
+    tables = payload.get("tables") or []
+    if not isinstance(tables, list):
+        raise RuntimeError(f"TPEx {day}: tables is not a list")
     result = []
-    for cols in payload["aaData"]:
-        # 0 code, 1 name, 2 close, 3 change, 4 open, 5 high, 6 low, 7 volume.
-        if not isinstance(cols, list) or len(cols) < 8:
+    found = False
+    for table in tables:
+        if not isinstance(table, dict):
             continue
-        item = normalize({"date": day, "code": cols[0], "name": cols[1],
-                          "close": cols[2], "open": cols[4], "high": cols[5],
-                          "low": cols[6], "volume": cols[7]}, "上櫃")
-        if item:
-            result.append(item)
+        fields = [str(f).strip().replace(" ", "") for f in table.get("fields", [])]
+        aliases = {
+            "code": ("代號", "證券代號"), "name": ("名稱", "證券名稱"),
+            "close": ("收盤", "收盤價"), "open": ("開盤", "開盤價"),
+            "high": ("最高", "最高價"), "low": ("最低", "最低價"),
+            "volume": ("成交股數", "成交股數(股)", "成交股數（股）"),
+        }
+        ix = {}
+        for k, labels in aliases.items():
+            ix[k] = next((fields.index(label) for label in labels if label in fields), None)
+        if any(i is None for i in ix.values()):
+            continue
+        found = True
+        for cols in table.get("data", []):
+            if not isinstance(cols, (list, tuple)) or len(cols) <= max(ix.values()):
+                continue
+            row = {"date": day, **{k: cols[i] for k, i in ix.items()}}
+            item = normalize(row, "上櫃")
+            if item:
+                result.append(item)
+    if not found:
+        raise RuntimeError(f"TPEx {day}: no complete OHLCV table (keys={list(payload.keys())})")
+    if len(result) < 100:
+        raise RuntimeError(f"TPEx {day}: only {len(result)} valid common stocks; possible incomplete payload")
     return result
 
 
 def backfill_recent_from_official(history, s, archive_cutoff, latest, twse_latest, tpex_latest):
-    """Replace most recent 7 days of community archive with historical official OHLCV.
-    Fetches missed Monday-Thursday sessions, rather than mixing stale Friday + today.
+    """Fill only sessions absent from the archive, then replace the latest
+    day's archived data with official exchange snapshots.
+
+    All available release weekly ZIPs are loaded first. In particular, on
+    weekends a freshly published week already contains Friday's quotes: do
+    NOT re-request its already archived weekday dates from fragile old APIs.
     """
-    day = date.fromisoformat(archive_cutoff) + timedelta(days=1)
+    if not history.all_market_dates:
+        raise RuntimeError("No historical trading dates to backfill from")
+    last_archive_day = max(history.all_market_dates)
     last = date.fromisoformat(latest)
+    if date.fromisoformat(last_archive_day) > last:
+        raise RuntimeError(f"Archive day {last_archive_day} newer than official latest {latest}; dates differ")
+    if (last - date.fromisoformat(last_archive_day)).days > 14:
+        raise RuntimeError(f"Archive is too old ({last_archive_day}) to safely patch to {latest}; verify data provider")
+    day = date.fromisoformat(last_archive_day) + timedelta(days=1)
     filled = []
     while day < last:
         if day.weekday() < 5:
             d = day.isoformat()
             a = historical_twse(s, d)
-            b = historical_tpex(s, d)
-            # None means holiday: both must be empty. One-sided data would corrupt cross-market signals.
-            if bool(a) != bool(b):
-                raise RuntimeError(f"Partial market history on {d}: TWSE={len(a)}, TPEx={len(b)}")
-            if a and b:
+            # No listed market data => no trading session; do not need a TPEX
+            # historical request. If TWSE has quote data, both markets must.
+            if a:
+                b = historical_tpex(s, d)
                 if len(a) < 100 or len(b) < 100:
-                    raise RuntimeError(f"Suspiciously small historical market data for {d}")
+                    raise RuntimeError(f"Incomplete official historical data for {d}: TWSE={len(a)} TPEx={len(b)}")
                 for item in sorted(a + b, key=lambda x: x["code"]):
                     history.insert(item)
                 filled.append(d)
         day += timedelta(days=1)
+    if len(twse_latest) < 100 or len(tpex_latest) < 100:
+        raise RuntimeError("Incomplete latest official snapshot; refuse partial screen")
     for item in sorted(twse_latest + tpex_latest, key=lambda x: x["code"]):
         history.insert(item)
     print(f"Official patched sessions: {filled + [latest]}", flush=True)
@@ -526,9 +591,9 @@ def main(argv=None):
     if not args.csv and not args.skip_official:
         s, twse_latest, tpex_latest, latest_data = fetch_official_latest_pair()
         if latest_data <= args.as_of:
-            # Fetch 7 calendar days from *official historical* APIs; daily release
-            # archives are only updated each Saturday and miss intraweek sessions.
-            cutoff = (date.fromisoformat(latest_data) - timedelta(days=7)).isoformat()
+            # Use all available archival weeks first. No need to overwrite
+            # archived dates just because they fall within the last seven days.
+            cutoff = latest_data
         else:
             latest_data = None
     if args.csv:
