@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""台股上市/上櫃動能訊號掃描器 (2026)
-使用歸檔歷史日線 + 交易所當日行情；判斷規則見 README.md。
+"""台股上市/上櫃電子與設備股動能訊號掃描器 v1.3 (2026)
+使用歸檔歷史日線 + 官方行情 + 官方公司產業代碼；判斷規則見 README.md。
 依賴: pandas, requests。歷史資料源為第三方公開 GitHub 壓縮檔（源於 TWSE/TPEx）。
 """
 from __future__ import annotations
@@ -30,6 +30,19 @@ REPO = "yukishirotsubasa/tw-stock-data-release"
 RELEASE_API = f"https://api.github.com/repos/{REPO}/releases/tags/daily-close-csv"
 TWSE_API = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 TPEX_API = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes"
+TWSE_PROFILE_API = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
+TPEX_PROFILE_API = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
+# Official TWSE/TPEx industry groups. 05 is a broad electrical machinery group,
+# not a precise semiconductor equipment category; results show the real category.
+INDUSTRY_NAMES = {
+    "05": "電機機械（含設備）", "24": "半導體", "25": "電腦及週邊設備",
+    "26": "光電", "27": "通信網路", "28": "電子零組件",
+    "29": "電子通路", "30": "資訊服務", "31": "其他電子", "36": "數位雲端",
+}
+ALLOWED_INDUSTRY_CODES = frozenset(INDUSTRY_NAMES)
+# Optional: add hand-verified industry exceptions with four-digit codes.
+# Example: EXTRA_EQUIPMENT_CODES = {"1234"}; empty by default.
+EXTRA_EQUIPMENT_CODES = frozenset()
 CODE = re.compile(r"^[1-9][0-9]{3}$")
 EXCLUDED_SUFFIX = ("DR", "R1", "R2", "特")
 # Indicator history window: 480+ trading sessions makes Wilder RSI seed effectively irrelevant.
@@ -470,102 +483,213 @@ def rsi_wilder(prices, period=14):
     return out
 
 
-def calc_signal(bars, history_start):
-    """Return a screen row or None. This evaluates the *latest* bar of one ticker."""
-    if len(bars) < 241:  # 240MA yesterday needs at least 241 trading bars
+def parse_industry_row(row, market):
+    """Return ((market, code), (industry_code, industry_label)), or None.
+
+    TWSE company directory uses Chinese keys, TPEx directory English keys.
+    Never infer industry from price-action or the stock's name.
+    """
+    if not isinstance(row, dict):
+        return None
+    if market == "上市":
+        code = str(row.get("公司代號", "")).strip()
+        industry = str(row.get("產業別", "")).strip()
+    else:
+        code = str(row.get("SecuritiesCompanyCode", "")).strip()
+        industry = str(row.get("SecuritiesIndustryCode", "")).strip()
+    if not CODE.fullmatch(code):
+        return None
+    if industry.isdigit():
+        industry_code = industry.zfill(2)
+    else:
+        # Unrecognized descriptions must not be treated as eligible.
+        return None
+    return (market, code), (industry_code, INDUSTRY_NAMES.get(industry_code, f"其他產業({industry_code})"))
+
+
+def industry_map_from_official(session_obj):
+    """Fetch BOTH official company directories; refuse incomplete/unavailable data."""
+    output = {}
+    for market, url in (("上市", TWSE_PROFILE_API), ("上櫃", TPEX_PROFILE_API)):
+        response = session_obj.get(url, timeout=50)
+        response.raise_for_status()
+        raw = response.json()
+        if not isinstance(raw, list) or len(raw) < 100:
+            raise RuntimeError(f"{market}: official company profile data missing/incomplete")
+        parsed = dict(filter(None, (parse_industry_row(r, market) for r in raw)))
+        if len(parsed) < 100 or len(parsed) < len(raw) * 0.6:
+            raise RuntimeError(f"{market}: industry code parse insufficient ({len(parsed)}/{len(raw)}); schema changed?")
+        output.update(parsed)
+        print(f"Industry directory {market}: {len(parsed):,} 4-digit symbols", flush=True)
+    return output
+
+
+def industry_map_from_csv(path):
+    """Offline testing option: CSV with 'market,code,industry' columns."""
+    industry_map = {}
+    with Path(path).open(encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        expected = {"market", "code", "industry"}
+        if not reader.fieldnames or not expected.issubset(reader.fieldnames):
+            raise ValueError(f"Industry CSV must contain {', '.join(sorted(expected))}")
+        for r in reader:
+            m = str(r["market"]).strip()
+            c = str(r["code"]).strip()
+            ind = str(r["industry"]).strip()
+            if m not in ("上市", "上櫃"):
+                raise ValueError(f"Invalid market {m!r} in industry CSV")
+            result = parse_industry_row({"公司代號": c, "產業別": ind}, "上市")
+            if result is None:
+                raise ValueError(f"Invalid industry CSV code/industry: {c!r}, {ind!r}")
+            industry_map[(m,c)] = result[1]
+    if not industry_map:
+        raise ValueError("Industry CSV is empty")
+    return industry_map
+
+
+def condition3_price_volume(price, today_vol_lots):
+    """Strict price bands/lot limits; prices of exactly 50 or 200 do not match."""
+    return ((price > 200 and today_vol_lots > 6000) or
+            (50 < price < 200 and today_vol_lots > 15000))
+
+
+def calc_signal(bars, history_start, industry_code, industry_name):
+    """Return a matching row or None; all volume input data is SHARES, outputs LOTS."""
+    if len(bars) < 120:
         return None
     closes = pd.Series([x["close"] for x in bars], dtype="float64")
     volumes = pd.Series([x["volume"] for x in bars], dtype="float64")
-    ma20 = closes.rolling(20).mean()
-    ma60 = closes.rolling(60).mean()
-    ma120 = closes.rolling(120).mean()
-    ma240 = closes.rolling(240).mean()
+    ma5 = float(closes.iloc[-5:].mean())
+    ma10 = float(closes.iloc[-10:].mean())
+    ma20 = float(closes.iloc[-20:].mean())
+    ma60 = float(closes.iloc[-60:].mean())
+    ma120 = float(closes.iloc[-120:].mean())
     rsis = rsi_wilder(closes, 14)
-    vol3, vol12 = volumes.tail(3).mean(), volumes.tail(12).mean()
-    must = vol3 > vol12
-    if not must:
+    rsi_prev, rsi_now = float(rsis.iloc[-2]), float(rsis.iloc[-1])
+    vol10 = float(volumes.iloc[-10:].mean()) / 1000.0
+    vol30 = float(volumes.iloc[-30:].mean()) / 1000.0
+    today_vol = float(volumes.iloc[-1]) / 1000.0
+    # Both mandatory volume requirements (>=1000 lots, not shares).
+    if not (vol10 > vol30 and vol30 >= 1000):
         return None
-    a, b = float(rsis.iloc[-2]), float(rsis.iloc[-1])
-    cond1 = (ma120.iloc[-1] > ma120.iloc[-2] and ma240.iloc[-1] > ma240.iloc[-2]
-             and a <= 30 < b)
-    cond2 = ma20.iloc[-1] > ma60.iloc[-1] and a <= 45 < b
-    cond3 = ma20.iloc[-2] <= ma60.iloc[-2] and ma20.iloc[-1] > ma60.iloc[-1]
-    v10prev = float(volumes.iloc[-11:-1].mean())
-    prev_high = bars[-1]["prior_high"]
-    cond4 = prev_high is not None and volumes.iloc[-1] > v10prev and closes.iloc[-1] > prev_high
-    conditions = [bool(cond1), bool(cond2), bool(cond3), bool(cond4)]
+    price = float(closes.iloc[-1])
+    # C2: the 60-day window EXCLUDES today, using closing prices (not highs).
+    prior60_max_close = float(closes.iloc[-61:-1].max())
+    c1 = bool(ma20 > ma60 > ma120 and rsi_now > 50 > rsi_prev)
+    c2 = bool(price > prior60_max_close)
+    # Exactly 200 or 50 are excluded by the user's strict inequalities.
+    c3 = bool(condition3_price_volume(price, today_vol))
+    c4 = bool(ma5 > ma10 > ma20 > ma60 > ma120)
+    conditions = [c1, c2, c3, c4]
     if not any(conditions):
         return None
-    latest = bars[-1]
+    last = bars[-1]
     return {
-        "日期": latest["date"], "代號": latest["code"], "名稱": latest["name"],
-        "市場": latest["market"], "收盤價": round(float(closes.iloc[-1]), 4),
-        "今日成交量(張)": round(float(volumes.iloc[-1] / 1000), 2),
-        "3日均量(張)": round(float(vol3 / 1000), 2),
-        "12日均量(張)": round(float(vol12 / 1000), 2),
-        "量比_3日比12日": round(float(vol3 / vol12), 4),
-        "RSI14_昨日": round(a, 2), "RSI14_今日": round(b, 2),
-        "MA20": round(float(ma20.iloc[-1]), 4), "MA60": round(float(ma60.iloc[-1]), 4),
-        "MA120": round(float(ma120.iloc[-1]), 4), "MA240": round(float(ma240.iloc[-1]), 4),
-        "歷史前高(盤中)": round(float(prev_high), 4) if prev_high else "",
-        "前10日均量(張)": round(v10prev / 1000, 2),
-        "條件1": conditions[0], "條件2": conditions[1], "條件3": conditions[2], "條件4": conditions[3],
+        "日期": last["date"], "代號": last["code"], "名稱": last["name"],
+        "市場": last["market"], "產業代碼": industry_code, "產業": industry_name,
+        "收盤價": round(price, 4), "今日成交量(張)": round(today_vol, 2),
+        "10日均量(張)": round(vol10, 2), "30日均量(張)": round(vol30, 2),
+        "量比_10日比30日": round(vol10 / vol30, 4),
+        "RSI14_昨日": round(rsi_prev, 2), "RSI14_今日": round(rsi_now, 2),
+        "MA5": round(ma5, 4), "MA10": round(ma10, 4), "MA20": round(ma20, 4),
+        "MA60": round(ma60, 4), "MA120": round(ma120, 4),
+        "前60日最高收盤價": round(prior60_max_close, 4),
+        "條件1": c1, "條件2": c2, "條件3": c3, "條件4": c4,
         "符合條件": ",".join(str(i) for i, v in enumerate(conditions, start=1) if v),
-        "符合項目數": sum(conditions),
-        "資料最早日期": history_start,
+        "符合項目數": sum(conditions), "資料最早日期": history_start,
     }
 
 
-def screen(history, as_of):
+def screen(history, as_of, industry_map):
+    """Only contemporaneous 120-market-session OHLCV; fail closed on unknown industry."""
     if not history.all_market_dates:
         raise RuntimeError("No data loaded")
-    date_latest = max(d for d in history.all_market_dates if d <= as_of)
-    result = []
+    market_dates = sorted(d for d in history.all_market_dates if d <= as_of)
+    if len(market_dates) < 120:
+        raise RuntimeError(f"Only {len(market_dates)} market sessions; need at least 120")
+    date_latest = market_dates[-1]
+    last120market = set(market_dates[-120:])
+    results = []
     eligible = 0
-    # Volume 3/12 windows must refer to the same 12 market sessions;
-    # avoid silently using 12 older active bars when a stock was suspended.
-    last12market = set(sorted(d for d in history.all_market_dates if d <= date_latest)[-12:])
+    industry_pool = 0
+    industry_missing = 0
+    # Historical community CSV lacks a market column. Match ticker code to an
+    # official directory ONLY when that code unambiguously belongs to one board.
+    by_code = defaultdict(list)
+    for (market, code), sector in industry_map.items():
+        by_code[code].append((market, sector))
     for code, arr in history.bars.items():
         if not arr or arr[-1]["date"] != date_latest:
             continue
-        if len(arr) < 241 or not last12market.issubset({r["date"] for r in list(arr)[-12:]}):
+        latest_market = arr[-1]["market"]
+        sector = industry_map.get((latest_market, code))
+        if sector is None and latest_market == "歷史來源":
+            candidates = by_code.get(code, [])
+            if len(candidates) == 1:
+                latest_market, sector = candidates[0]
+        if sector is None:
+            industry_missing += 1
+            continue
+        sector_code, sector_name = sector
+        if sector_code not in ALLOWED_INDUSTRY_CODES and code not in EXTRA_EQUIPMENT_CODES:
+            continue
+        industry_pool += 1
+        if len(arr) < 120 or not last120market.issubset({r["date"] for r in list(arr)[-120:]}):
             continue
         eligible += 1
-        x = calc_signal(list(arr), history.first_date[code])
-        if x:
-            result.append(x)
-    result.sort(key=lambda x: (-x["符合項目數"], -x["量比_3日比12日"], x["代號"]))
-    return date_latest, eligible, result
+        bars = list(arr)
+        if latest_market != bars[-1]["market"]:
+            bars[-1] = dict(bars[-1], market=latest_market)
+        row = calc_signal(bars, history.first_date[code], sector_code, sector_name)
+        if row:
+            results.append(row)
+    if industry_missing > 0:
+        print(f"Industry unmapped (excluded): {industry_missing} latest symbols", flush=True)
+    results.sort(key=lambda x: (-x["符合項目數"], -x["量比_10日比30日"], x["代號"]))
+    return date_latest, eligible, results, industry_pool
 
 
-def write_reports(outdir, latest, eligible, signals, first_date, missing_years, official_day):
+def write_reports(outdir, latest, eligible, signals, first_date, missing_years, official_day, industry_pool):
     outdir.mkdir(parents=True, exist_ok=True)
-    cols = ["日期", "代號", "名稱", "市場", "收盤價", "今日成交量(張)", "3日均量(張)", "12日均量(張)",
-            "量比_3日比12日", "RSI14_昨日", "RSI14_今日", "MA20", "MA60", "MA120", "MA240",
-            "歷史前高(盤中)", "前10日均量(張)", "條件1", "條件2", "條件3", "條件4", "符合條件", "符合項目數", "資料最早日期"]
+    cols = ["日期", "代號", "名稱", "市場", "產業代碼", "產業", "收盤價", "今日成交量(張)",
+            "10日均量(張)", "30日均量(張)", "量比_10日比30日", "RSI14_昨日", "RSI14_今日",
+            "MA5", "MA10", "MA20", "MA60", "MA120", "前60日最高收盤價",
+            "條件1", "條件2", "條件3", "條件4", "符合條件", "符合項目數", "資料最早日期"]
     df = pd.DataFrame(signals, columns=cols)
     df.to_csv(outdir / "signals.csv", index=False, encoding="utf-8-sig")
-    lines = [f"# 台股動能篩選報告 — {latest}", "",
-             f"- 最近行情日：**{latest}**", f"- 具備足夠歷史資料並於該日有交易的股票：**{eligible} 檔**",
-             f"- 必要條件＋至少一項選擇條件：**{len(signals)} 檔**",
-             f"- 本次官方快照日期：**{official_day or '未使用（僅歸檔資料）'}**",
-             f"- 歷史資料源最早年份：**{first_date[:4] if first_date else '未知'}**",
-             "- C4 的歷史最高價僅依實際取得的原始（未還原）歷史日線判斷，不可視為已驗證上市以來最高價。",
-             "- 此報告為機械訊號，並非經過回測證實的獲利策略。", ""]
+    lines = [f"# 台股電子／設備動能篩選報告 — {latest}", "",
+             f"- 最新行情日：**{latest}**",
+             f"- 符合產業範圍的當日股票：**{industry_pool} 檔**",
+             f"- 產業符合且具備連續 120 個交易日資料：**{eligible} 檔**",
+             f"- 必要條件全部符合且觸發至少 1 個訊號：**{len(signals)} 檔**",
+             f"- 官方當日快照：**{official_day or '未使用（僅歸檔資料）'}**",
+             "- 必要條件：10 日平均成交量 > 30 日平均成交量，且 30 日平均成交量 ≥ 1,000 張，且產業在設定範圍。",
+             "- C1：MA20 > MA60 > MA120，且 RSI(14) 昨日 < 50 < 今日。",
+             "- C2：今日收盤 > 前 60 個交易日最高收盤價（不含今日）。",
+             "- C3：收盤 > 200 且成交量 > 6,000 張，或 50 < 收盤 < 200 且成交量 > 15,000 張。",
+             "- C4：MA5 > MA10 > MA20 > MA60 > MA120。",
+             "- 產業代碼：05 電機機械（較廣泛，非全數為半導體設備）、24～31 電子產業、36 數位雲端。",
+             "- 均線與突破比較採原始（未還原）收盤價，除權息／拆股日需另行審慎判讀。",
+             "- 本報告是機械化訊號，不代表已回測或保證報酬。", ""]
     if missing_years:
-        lines.append(f"⚠ 缺少年份 {missing_years}，因此 C4 歷史高判斷可能不完整。")
+        lines.append(f"⚠ 歷史封存缺少年份：{missing_years}。")
     if signals:
-        lines.extend(["| 代號 | 名稱 | 市場 | 收盤價 | 成交量比(3/12) | RSI14 | 觸發條件 |",
-                      "|---|---|---|---:|---:|---:|---|"])
+        lines.extend(["| 代號 | 名稱 | 市場 | 產業 | 收盤價 | 當日量(張) | 10日/30日均量比 | RSI14 | 觸發條件 |",
+                      "|---|---|---|---|---:|---:|---:|---:|---|"])
         for s in signals:
-            lines.append(f"| {s['代號']} | {s['名稱']} | {s['市場']} | {s['收盤價']} | {s['量比_3日比12日']:.2f} | {s['RSI14_今日']:.2f} | {s['符合條件']} |")
+            lines.append(f"| {s['代號']} | {s['名稱']} | {s['市場']} | {s['產業']} | "
+                         f"{s['收盤價']} | {s['今日成交量(張)']:,.0f} | "
+                         f"{s['量比_10日比30日']:.2f} | {s['RSI14_今日']:.2f} | {s['符合條件']} |")
     else:
-        lines.append("沒有同時通過必要條件和任一選擇條件的股票。")
+        lines.append("本交易日沒有符合全部必要條件且觸發至少一項篩選訊號的股票。")
     (outdir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    metadata = {"as_of": latest, "eligible": eligible, "matched": len(signals), "missing_years": missing_years,
-                "official_snapshot": official_day, "signal_ids": [x["代號"] for x in signals]}
+    metadata = {"as_of": latest, "industry_pool": industry_pool, "eligible": eligible,
+                "matched": len(signals), "missing_years": missing_years,
+                "official_snapshot": official_day, "allowed_industry_codes": sorted(ALLOWED_INDUSTRY_CODES),
+                "extra_equipment_codes": sorted(EXTRA_EQUIPMENT_CODES),
+                "signal_ids": [x["代號"] for x in signals]}
     (outdir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\nAs-of {latest}, eligible {eligible}, matched {len(signals)}")
+    print(f"\nAs-of {latest}, industry_pool {industry_pool}, eligible {eligible}, matched {len(signals)}")
     print(f"Saved: {outdir / 'signals.csv'} | {outdir / 'report.md'}")
     if os.getenv("GITHUB_STEP_SUMMARY"):
         with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as f:
@@ -581,6 +705,7 @@ def main(argv=None):
     p.add_argument("--cache", type=Path, default=Path("data/archive"))
     p.add_argument("--output", type=Path, default=Path("output"))
     p.add_argument("--skip-official", action="store_true", help="Do not use official exchange snapshots/backfill")
+    p.add_argument("--industry-csv", type=Path, help="Offline CSV industry directory: market,code,industry (otherwise fetch official live directories)")
     args = p.parse_args(argv)
     date.fromisoformat(args.as_of)
     hist = History()
@@ -605,9 +730,11 @@ def main(argv=None):
     if latest_data is not None:
         official = backfill_recent_from_official(hist, s, cutoff, latest_data,
                                                  twse_latest, tpex_latest)
-    latest, eligible, matches = screen(hist, args.as_of)
+    industry_map = (industry_map_from_csv(args.industry_csv) if args.industry_csv
+                    else industry_map_from_official(session()))
+    latest, eligible, matches, industry_pool = screen(hist, args.as_of, industry_map)
     start_date = min(hist.all_market_dates) if hist.all_market_dates else None
-    write_reports(args.output, latest, eligible, matches, start_date, missing, official)
+    write_reports(args.output, latest, eligible, matches, start_date, missing, official, industry_pool)
 
 
 if __name__ == "__main__":
