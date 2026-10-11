@@ -1,0 +1,43 @@
+
+name: Taiwan Momentum Daily Scan
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 10 * * 1-5'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Cache historical data
+        uses: actions/cache@v4
+        with:
+          path: data/archive
+          key: tw-momentum-archives-${{ runner.os }}-v1
+
+      - name: Run screener
+        run: python screener.py --cache data/archive --output output
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: momentum-report-${{ github.run_number }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 30
