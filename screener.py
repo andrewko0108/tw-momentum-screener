@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""台股上市/上櫃電子與設備股動能訊號掃描器 v1.3 (2026)
+"""台股上市/上櫃電子與設備股動能訊號＋追蹤報酬掃描器 v1.4 (2026)
 使用歸檔歷史日線 + 官方行情 + 官方公司產業代碼；判斷規則見 README.md。
 依賴: pandas, requests。歷史資料源為第三方公開 GitHub 壓縮檔（源於 TWSE/TPEx）。
 """
@@ -46,7 +46,15 @@ EXTRA_EQUIPMENT_CODES = frozenset()
 CODE = re.compile(r"^[1-9][0-9]{3}$")
 EXCLUDED_SUFFIX = ("DR", "R1", "R2", "特")
 # Indicator history window: 480+ trading sessions makes Wilder RSI seed effectively irrelevant.
-MAX_BARS = 500
+MAX_BARS = 650
+# Replay recent ~480 trading sessions every run. Does not depend on GitHub runner filesystem
+# state (GitHub Actions starts from a clean environment on each execution).
+REPLAY_DAYS = 480
+# Explicit, configurable volume definition for a bearish high-volume candle.
+BEARISH_VOLUME_MULTIPLIER = 1.0  # today's shares strictly > yesterday's shares
+LONG_BLACK_BODY_PCT = 5.0
+UPPER_WICK_DRAWDOWN_PCT = 7.0
+UPPER_WICK_MIN_VOLUME_PREV_MULTIPLIER = 0.55
 TZ_TAIPEI = ZoneInfo("Asia/Taipei")
 
 
@@ -696,6 +704,393 @@ def write_reports(outdir, latest, eligible, signals, first_date, missing_years, 
             f.write("\n".join(lines) + "\n")
 
 
+
+
+# === v1.4 rolling watchlist and exit/return accounting =======================
+# A signal is an entry event, not a requirement that must recur each day.
+# A position survives until an explicit exit trigger, even if its entry criteria
+# stop matching. This is a model portfolio for research, not a live brokerage order.
+
+
+def exit_flags(today, ma10, prev_volume):
+    """Return exit conditions and raw intermediate data; all volume in SHARES."""
+    close = float(today["close"])
+    high = float(today["high"])
+    open_ = float(today["open"])
+    volume = float(today["volume"])
+    upper_drop = (high - close) / high * 100.0
+    body_drop = (open_ - close) / open_ * 100.0
+    v_ratio = volume / prev_volume if prev_volume and prev_volume > 0 else None
+    e1 = bool(pd.notna(ma10) and close < float(ma10))
+    e2 = bool(v_ratio is not None and v_ratio >= UPPER_WICK_MIN_VOLUME_PREV_MULTIPLIER
+              and upper_drop >= UPPER_WICK_DRAWDOWN_PCT)
+    e3 = bool(v_ratio is not None and v_ratio > BEARISH_VOLUME_MULTIPLIER
+              and body_drop >= LONG_BLACK_BODY_PCT)
+    return (e1, e2, e3), {
+        "高點至收盤回落%": round(upper_drop, 4),
+        "開盤至收盤跌幅%": round(body_drop, 4),
+        "當日量/前日量": round(v_ratio, 4) if v_ratio is not None else None,
+    }
+
+
+def resolve_industry(history_market, ticker, industry_map, by_code):
+    sector = industry_map.get((history_market, ticker))
+    if sector is not None:
+        return history_market, sector
+    if history_market == "歷史來源" and len(by_code.get(ticker, [])) == 1:
+        return by_code[ticker][0]
+    return history_market, None
+
+
+def build_tracking_events(history, market_days, industry_map, start_day):
+    """Compute each ticker's indicators once; assemble per-date signal/exit events.
+
+    Daily snapshots require 120 consecutive MARKET sessions of data; missing
+    daily prices cannot be silently treated as adjacent sessions. Exits are
+    evaluated when the ticker actually trades; no fabricated prices on halts.
+    """
+    index_of = {d: i for i, d in enumerate(market_days)}
+    by_code = defaultdict(list)
+    for (market, code), sector in industry_map.items():
+        by_code[code].append((market, sector))
+    daily = defaultdict(dict)
+    quotes_by_day = defaultdict(dict)
+    eligible_latest = 0
+    industry_latest = 0
+    latest_day = market_days[-1]
+    for code, recent in history.bars.items():
+        if not recent:
+            continue
+        bars = list(recent)
+        actual_market, sector = resolve_industry(bars[-1]['market'], code, industry_map, by_code)
+        if sector is None:
+            continue
+        industry_code, industry_name = sector
+        if industry_code not in ALLOWED_INDUSTRY_CODES and code not in EXTRA_EQUIPMENT_CODES:
+            continue
+        if bars[-1]['date'] == latest_day:
+            industry_latest += 1
+        if len(bars) < 120:
+            continue
+        df = pd.DataFrame(bars)
+        close = pd.to_numeric(df['close'], errors='coerce')
+        volume = pd.to_numeric(df['volume'], errors='coerce')
+        dates = df['date'].tolist()
+        ordinals = [index_of.get(d) for d in dates]
+        ma = {k: close.rolling(k, min_periods=k).mean() for k in (5, 10, 20, 60, 120)}
+        high60_close = close.shift(1).rolling(60, min_periods=60).max()
+        rsi = rsi_wilder(close, 14)
+        prev_close = close.shift(1)
+        prev_volume = volume.shift(1)
+        vol10 = volume.rolling(10, min_periods=10).mean()
+        vol30 = volume.rolling(30, min_periods=30).mean()
+        for i in range(119, len(bars)):
+            day = dates[i]
+            if day < start_day:
+                continue
+            d_idx = ordinals[i]
+            # Require actual 120 continuous market-session bars.
+            complete = (d_idx is not None and ordinals[i-119] is not None and
+                        d_idx - ordinals[i-119] == 119)
+            if day == latest_day and complete:
+                eligible_latest += 1
+            price = float(close.iat[i])
+            prev = float(prev_close.iat[i]) if pd.notna(prev_close.iat[i]) else None
+            previous_day_actual = (i > 0 and d_idx is not None and
+                                   ordinals[i - 1] == d_idx - 1)
+            delta = ((price / prev - 1) * 100 if
+                     previous_day_actual and prev and prev > 0 else None)
+            exit_v = float(prev_volume.iat[i]) if pd.notna(prev_volume.iat[i]) else None
+            exits, diagnostic = exit_flags(bars[i], ma[10].iat[i], exit_v)
+            sig = [False] * 4
+            v10_lots = float(vol10.iat[i] / 1000) if pd.notna(vol10.iat[i]) else None
+            v30_lots = float(vol30.iat[i] / 1000) if pd.notna(vol30.iat[i]) else None
+            is_mandatory = bool(complete and v10_lots is not None and v30_lots is not None
+                                and v10_lots > v30_lots and v30_lots >= 1000)
+            if is_mandatory:
+                prev_rsi = float(rsi.iat[i - 1])
+                now_rsi = float(rsi.iat[i])
+                sig = [
+                    bool(ma[20].iat[i] > ma[60].iat[i] > ma[120].iat[i]
+                         and now_rsi > 50 > prev_rsi),
+                    bool(price > float(high60_close.iat[i])),
+                    condition3_price_volume(price, float(volume.iat[i]) / 1000),
+                    bool(ma[5].iat[i] > ma[10].iat[i] > ma[20].iat[i] > ma[60].iat[i] > ma[120].iat[i]),
+                ]
+            row = {
+                "日期": day, "代號": code, "名稱": bars[i]["name"], "市場": actual_market,
+                "產業代碼": industry_code, "產業": industry_name,
+                "收盤價": round(price, 4),
+                "前日收盤價": round(prev, 4) if prev is not None else None,
+                "當日漲跌幅%": round(delta, 4) if delta is not None else None,
+                "今日成交量(張)": round(float(volume.iat[i]) / 1000, 3),
+                "10日均量(張)": round(v10_lots, 3) if v10_lots is not None else None,
+                "30日均量(張)": round(v30_lots, 3) if v30_lots is not None else None,
+                "量比_10日比30日": round(v10_lots / v30_lots, 4) if v30_lots else None,
+                "RSI14": round(float(rsi.iat[i]), 3) if pd.notna(rsi.iat[i]) else None,
+                "MA5": round(float(ma[5].iat[i]), 4),
+                "MA10": round(float(ma[10].iat[i]), 4),
+                "MA20": round(float(ma[20].iat[i]), 4),
+                "MA60": round(float(ma[60].iat[i]), 4),
+                "MA120": round(float(ma[120].iat[i]), 4),
+                "前60日最高收盤價": (round(float(high60_close.iat[i]), 4)
+                                    if pd.notna(high60_close.iat[i]) else None),
+                "符合條件": ','.join(str(j) for j, flag in enumerate(sig, 1) if flag),
+                "符合項目數": sum(sig),
+                "汰除條件": ','.join(str(j) for j, flag in enumerate(exits, 1) if flag),
+                **diagnostic,
+                "當日K線完整": complete,
+            }
+            # To avoid excessive memory, retain only possible entries/exits.
+            if row['符合項目數'] or row['汰除條件']:
+                daily[day][code] = row
+            # BUT ordinary active positions need current closes and pct even
+            # without any signal. Keep a separate lightweight quote index.
+            # We use a per-day map below from the same row.
+            quotes_by_day[day][code] = row
+    return daily, quotes_by_day, eligible_latest, industry_latest
+
+
+def r4(value):
+    return round(float(value), 4)
+
+
+def tracking_replay(history, as_of, industry_map):
+    market_days = sorted(d for d in history.all_market_dates if d <= as_of)
+    if len(market_days) < 125:
+        raise RuntimeError('At least 125 market sessions required for tracking')
+    replay_days = market_days[-min(REPLAY_DAYS, len(market_days) - 121):]
+    if len(replay_days) < 2:
+        raise RuntimeError('Insufficient sessions for daily comparison')
+    first = replay_days[0]
+    # Recompute from daily source history (GitHub runner is ephemeral).
+    events, quotes_by_day, eligible, industry_count = build_tracking_events(
+        history, market_days, industry_map, first)
+    day_indices = {d: idx for idx, d in enumerate(market_days)}
+    active = {}  # code -> entry metadata
+    daily_snapshots, daily_changes, trades = [], [], []
+    yesterday_active_rows, latest_active_rows = [], []
+    latest_new, latest_exit, latest_blocked = [], [], []
+    prev_day = market_days[-2]
+    latest_day = market_days[-1]
+
+    for day in replay_days:
+        q = quotes_by_day[day]
+        ev = events[day]
+        todays_new, todays_exit, todays_blocked = [], [], []
+        prev_codes = set(active)
+        # Exit: only if an explicit exit flag AND a real OHLCV bar is available.
+        for code in list(active):
+            row = q.get(code)
+            if row is None or not row['汰除條件']:
+                continue
+            p = active.pop(code)
+            duration_sessions = day_indices[day] - day_indices[p['入選日期']]
+            closed = {**row, "事件": "剔除", "入選日期": p['入選日期'],
+                      "入選收盤價": p['入選收盤價'], "入選條件": p['入選條件'],
+                      "持續入選交易日數": duration_sessions,
+                      "入選後報酬率%": r4((row['收盤價'] / p['入選收盤價'] - 1) * 100),
+                      "已連續追蹤至少2日": duration_sessions >= 2,
+                      "汰除日期": day, "汰除收盤價": row['收盤價']}
+            trades.append(closed)
+            todays_exit.append(closed)
+            daily_changes.append(closed)
+        # Entry: signal AND mandatory conditions already guaranteed by events;
+        # a simultaneous exit condition blocks opening a new position.
+        for code, row in ev.items():
+            if not row['符合項目數'] or code in active:
+                continue
+            if row['汰除條件']:
+                if code not in prev_codes:
+                    blocked = {**row, '事件': '同日訊號但觸發汰除（未入選）'}
+                    todays_blocked.append(blocked)
+                    daily_changes.append(blocked)
+                continue
+            active[code] = {'入選日期': day, '入選收盤價': row['收盤價'],
+                            '入選條件': row['符合條件'], '名稱': row['名稱']}
+            record = {**row, '事件': '新增', '入選日期': day,
+                      '入選收盤價': row['收盤價'], '入選條件': row['符合條件'],
+                      '持續入選交易日數': 1, '入選後報酬率%': 0.0}
+            todays_new.append(record)
+            daily_changes.append(record)
+        todays_active = []
+        todays_new_codes = {x['代號'] for x in todays_new}
+        for code, p in sorted(active.items()):
+            row = q.get(code)
+            if row is None:
+                # Not traded / incomplete data; do not invent daily pct or P&L.
+                row = {'日期': day, '代號': code, '名稱': p.get('名稱', ''),
+                       '收盤價': None, '當日漲跌幅%': None, '符合條件': '',
+                       '汰除條件': '', '資料狀態': '本日無日線，待確認'}
+            duration = day_indices[day] - day_indices[p['入選日期']] + 1
+            ret = ((row['收盤價'] / p['入選收盤價'] - 1) * 100
+                   if row.get('收盤價') is not None else None)
+            item = {**row, '事件': ('新增' if code in todays_new_codes else '持續追蹤'),
+                    '入選日期': p['入選日期'], '入選收盤價': p['入選收盤價'],
+                    '入選條件': p['入選條件'], '持續入選交易日數': duration,
+                    '入選後報酬率%': r4(ret) if ret is not None else None,
+                    '已連續追蹤至少2日': duration >= 2,
+                    '資料狀態': row.get('資料狀態', '正常')}
+            todays_active.append(item)
+            daily_snapshots.append(item)
+        if day == prev_day:
+            yesterday_active_rows = todays_active
+        if day == latest_day:
+            latest_active_rows = todays_active
+            latest_new, latest_exit, latest_blocked = todays_new, todays_exit, todays_blocked
+
+    # Include still-open positions in the trade ledger (MTM at latest close).
+    opened = []
+    for item in latest_active_rows:
+        opened.append({**item, '狀態': '持續追蹤', '汰除日期': '',
+                       '汰除收盤價': None})
+    closed = [{**x, '狀態': '已汰除'} for x in trades]
+    ledger = sorted(closed + opened,
+                    key=lambda x: (x.get('入選日期', ''), x.get('代號', ''),
+                                   x.get('汰除日期', '')))
+    today_set = {r['代號'] for r in latest_active_rows}
+    yday_set = {r['代號'] for r in yesterday_active_rows}
+    if today_set - yday_set != {r['代號'] for r in latest_new}:
+        raise AssertionError("Today added set mismatches daily replay")
+    if yday_set - today_set != {r['代號'] for r in latest_exit}:
+        raise AssertionError("Today removed set mismatches exit replay")
+    return {'latest': latest_day, 'yesterday': prev_day, 'replay_start': first,
+            'eligible': eligible, 'industry_pool': industry_count,
+            'today': latest_active_rows, 'yesterday_rows': yesterday_active_rows,
+            'added': latest_new, 'removed': latest_exit, 'blocked': latest_blocked,
+            'daily_snapshots': daily_snapshots, 'daily_changes': daily_changes,
+            'trades': ledger, 'closed_count': len(closed),
+            'data_window_bounded': len(market_days) > len(replay_days) + 121}
+
+
+REPORT_COLS = ['日期', '代號', '名稱', '市場', '產業代碼', '產業', '事件',
+               '收盤價', '前日收盤價', '當日漲跌幅%', '今日成交量(張)',
+               '10日均量(張)', '30日均量(張)', '量比_10日比30日',
+               'RSI14', 'MA5', 'MA10', 'MA20', 'MA60', 'MA120',
+               '前60日最高收盤價', '符合條件', '符合項目數',
+               '汰除條件', '高點至收盤回落%', '開盤至收盤跌幅%',
+               '當日量/前日量', '入選日期', '入選收盤價', '入選條件',
+               '持續入選交易日數', '入選後報酬率%', '已連續追蹤至少2日',
+               '汰除日期', '汰除收盤價', '狀態', '資料狀態']
+
+
+def to_csv(rows, dest):
+    pd.DataFrame(rows, columns=REPORT_COLS).to_csv(dest, index=False, encoding='utf-8-sig')
+
+
+def pct(x):
+    return '—' if x is None or pd.isna(x) else f'{float(x):+.2f}%'
+
+
+def fprice(x):
+    return '—' if x is None or pd.isna(x) else f'{float(x):,.2f}'
+
+
+def md_rows(lines, rows, with_exit=False):
+    if not rows:
+        lines.append('（無）')
+        return
+    if with_exit:
+        lines += ['| 代號 | 名稱 | 今日漲跌幅 | 進場日 | 進場價 | 汰除價 | 累積報酬 | 汰除 E |',
+                  '|---|---|---:|---|---:|---:|---:|---|']
+        for r in rows:
+            lines.append(f"| {r['代號']} | {r['名稱']} | {pct(r.get('當日漲跌幅%'))} | "
+                         f"{r.get('入選日期','')} | {fprice(r.get('入選收盤價'))} | "
+                         f"{fprice(r.get('汰除收盤價'))} | {pct(r.get('入選後報酬率%'))} | "
+                         f"{r.get('汰除條件','')} |")
+        return
+    lines += ['| 代號 | 名稱 | 當日漲跌幅 | 收盤 | 入選日 | 追蹤交易日 | 累積報酬 | 入選 C |',
+              '|---|---|---:|---:|---|---:|---:|---|']
+    for r in rows:
+        lines.append(f"| {r['代號']} | {r.get('名稱', '')} | {pct(r.get('當日漲跌幅%'))} | "
+                     f"{fprice(r.get('收盤價'))} | {r.get('入選日期', '')} | "
+                     f"{r.get('持續入選交易日數','')} | {pct(r.get('入選後報酬率%'))} | "
+                     f"{r.get('入選條件','')} |")
+
+
+def write_tracking_reports(outdir, result, missing_years, official_day):
+    outdir.mkdir(parents=True, exist_ok=True)
+    today = result['today']
+    yesterday = result['yesterday_rows']
+    added, removed, blocked = result['added'], result['removed'], result['blocked']
+    to_csv(today, outdir / 'signals.csv')  # legacy filename; NOW daily ACTIVE list.
+    to_csv(yesterday, outdir / 'yesterday_signals.csv')
+    to_csv(added, outdir / 'added.csv')
+    to_csv(removed, outdir / 'removed.csv')
+    to_csv(blocked, outdir / 'blocked_entries.csv')
+    to_csv(result['trades'], outdir / 'trades.csv')
+    to_csv(result['daily_snapshots'], outdir / 'daily_watchlist.csv')
+    to_csv(result['daily_changes'], outdir / 'daily_changes.csv')
+    metadata = {
+        'as_of': result['latest'], 'previous_trading_day': result['yesterday'],
+        'replay_start': result['replay_start'], 'industry_pool': result['industry_pool'],
+        'eligible': result['eligible'], 'active_count': len(today),
+        'previous_count': len(yesterday), 'added_count': len(added),
+        'removed_count': len(removed), 'blocked_count': len(blocked),
+        'closed_trades_in_window': result['closed_count'],
+        'missing_years': missing_years, 'official_snapshot': official_day,
+        'price_basis': 'raw_unadjusted_ohlcv',
+        'entry_assumption': 'signal_day_close', 'exit_assumption': 'exit_day_close',
+        'volume_unit': 'lots', 'replay_days': REPLAY_DAYS,
+        'tracking_state': 'reconstructed_from_rolling_history_every_run',
+        'tracking_limitations': ['rolling lookback boundary; entries before replay start not preserved',
+                                 'current company directory; survivorship/industry classification bias',
+                                 'raw unadjusted prices; no dividends/splits/fees/slippage'],
+        'exit_thresholds': {'below_ma10_strict': True, 'upper_drop_pct_gte': UPPER_WICK_DRAWDOWN_PCT,
+                            'volume_vs_previous_gte': UPPER_WICK_MIN_VOLUME_PREV_MULTIPLIER,
+                            'black_body_drop_pct_gte': LONG_BLACK_BODY_PCT,
+                            'black_volume_vs_previous_gt': BEARISH_VOLUME_MULTIPLIER},
+    }
+    (outdir / 'metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+    lines = [f"# 台股動能名單與理論報酬追蹤 — {result['latest']}", '',
+             f"- 今日 {result['latest']}：**{len(today)} 檔**；昨日 {result['yesterday']}：**{len(yesterday)} 檔**",
+             f"- **新增 {len(added)}、汰除 {len(removed)}、同日被阻擋 {len(blocked)}**",
+             f"- 可評估產業股票：{result['industry_pool']}；有連續 120 日資料：{result['eligible']}",
+             f"- 追蹤回放範圍：**{result['replay_start']} 至 {result['latest']}**，每次執行重新推算，並非永久資料庫。",
+             '- 進場：必要條件與 C1～C4 任一訊號成立，且當日無汰除條件；入選日收盤價為理論進場價。',
+             '- 持續持有：不要求每天重新觸發 C1～C4；直到 E1～E3 任一汰除條件成立才移除。',
+             '- E1：收盤 < MA10。',
+             '- E2：當日量 ≥ 昨日量 × 55%，且（最高價−收盤價）／最高價 ≥ 7%。',
+             f'- E3：當日量 > 昨日量 × {BEARISH_VOLUME_MULTIPLIER:g}，且（開盤價−收盤價）／開盤價 ≥ {LONG_BLACK_BODY_PCT:g}%。',
+             '- 收盤相對前一交易日收盤價的漲跌幅，與入選至當日或汰除日的累積報酬，是兩個不同指標。',
+             '- 資料價格 **未還原**，含除權息、拆股造成的價格不連續；報酬不含股利、手續費、稅費與滑價。',
+             '- 同日收盤確認訊號並假設同日收盤成交有可執行性偏差；回測時需考慮次日開盤成交。',
+             '- 歷史追蹤受回放起點與當前公司名冊限制，未涵蓋已下市公司；**不可視為無偏完整歷史回測**。',
+             f"- 官方近期資料更新：{official_day or '僅來源封存'}；歷史缺漏年份：{missing_years or '無'}。", '']
+    lines += ['## 本日名單（含當日漲跌幅）', '']
+    md_rows(lines, today)
+    lines += ['', '## 前一交易日名單（含該日漲跌幅）', '']
+    md_rows(lines, yesterday)
+    lines += ['', '## 今日新增', '']
+    md_rows(lines, added)
+    lines += ['', '## 今日汰除及理論累積報酬', '']
+    md_rows(lines, removed, with_exit=True)
+    lines += ['', '## 當日符合進場訊號但同時觸發汰除（未入選）', '']
+    if blocked:
+        lines += ['| 代號 | 名稱 | 收盤價 | 當日漲跌幅 | C | E |',
+                  '|---|---|---:|---:|---|---|']
+        for r in blocked:
+            lines.append(f"| {r['代號']} | {r['名稱']} | {fprice(r['收盤價'])} | "
+                         f"{pct(r['當日漲跌幅%'])} | {r['符合條件']} | {r['汰除條件']} |")
+    else:
+        lines.append('（無）')
+    lines += ['', '## 回測資料檔案', '',
+              '- `signals.csv`：今日**持續追蹤**名單（包含新入選及持有中的股票）。',
+              '- `yesterday_signals.csv`：昨日持續追蹤名單。',
+              '- `added.csv`、`removed.csv`：今日新增／汰除及退出理由。',
+              '- `blocked_entries.csv`：符合入選條件但同日已觸發汰除者。',
+              '- `trades.csv`：歷史已結束追蹤及目前持續追蹤部位，含進出場日期、價格與理論報酬。',
+              '- `daily_watchlist.csv`：回放期間每日名單、每日漲跌幅及當日累積報酬。',
+              '- `daily_changes.csv`：回放期間每日新增、剔除、同日阻擋事件。', '']
+    content = '\n'.join(lines) + '\n'
+    (outdir / 'report.md').write_text(content, encoding='utf-8')
+    print(f"As-of {result['latest']}, active {len(today)}, yesterday {len(yesterday)}, "
+          f"added {len(added)}, removed {len(removed)}, blocked {len(blocked)}", flush=True)
+    print(f"Saved {outdir/'report.md'}, {outdir/'signals.csv'}, {outdir/'trades.csv'}", flush=True)
+    if os.getenv('GITHUB_STEP_SUMMARY'):
+        with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as f:
+            f.write(content[:980000])
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="Taiwan stock momentum screening system")
     p.add_argument("--csv", type=Path, help="Offline CSV file or directory instead of GitHub yearly archives")
@@ -732,9 +1127,8 @@ def main(argv=None):
                                                  twse_latest, tpex_latest)
     industry_map = (industry_map_from_csv(args.industry_csv) if args.industry_csv
                     else industry_map_from_official(session()))
-    latest, eligible, matches, industry_pool = screen(hist, args.as_of, industry_map)
-    start_date = min(hist.all_market_dates) if hist.all_market_dates else None
-    write_reports(args.output, latest, eligible, matches, start_date, missing, official, industry_pool)
+    tracking = tracking_replay(hist, args.as_of, industry_map)
+    write_tracking_reports(args.output, tracking, missing, official)
 
 
 if __name__ == "__main__":
