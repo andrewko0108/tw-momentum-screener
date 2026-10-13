@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""台股上市/上櫃電子與設備股動能訊號＋追蹤報酬掃描器 v1.4 (2026)
+"""台股上市/上櫃電子與設備股動能訊號＋追蹤報酬掃描器 v1.5 (2026)
 使用歸檔歷史日線 + 官方行情 + 官方公司產業代碼；判斷規則見 README.md。
 依賴: pandas, requests。歷史資料源為第三方公開 GitHub 壓縮檔（源於 TWSE/TPEx）。
 """
@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import csv
 import io
+import html
 import json
 import os
 import re
@@ -49,7 +50,10 @@ EXCLUDED_SUFFIX = ("DR", "R1", "R2", "特")
 MAX_BARS = 650
 # Replay recent ~480 trading sessions every run. Does not depend on GitHub runner filesystem
 # state (GitHub Actions starts from a clean environment on each execution).
-REPLAY_DAYS = 480
+TRACKING_START = "2026-10-08"
+# Before the start date, 350 trading bars suffice for Wilder RSI convergence;
+# retain ALL sessions on/after TRACKING_START to keep the ledger reproducible.
+PRESTART_BARS = 350
 # Explicit, configurable volume definition for a bearish high-volume candle.
 BEARISH_VOLUME_MULTIPLIER = 1.0  # today's shares strictly > yesterday's shares
 LONG_BLACK_BODY_PCT = 5.0
@@ -123,7 +127,7 @@ def normalize(r, market="歷史來源"):
 
 class History:
     def __init__(self):
-        self.bars = defaultdict(lambda: deque(maxlen=MAX_BARS))
+        self.bars = defaultdict(lambda: deque(maxlen=PRESTART_BARS))
         self.max_high = {}
         self.first_date = {}
         self.all_market_dates = set()
@@ -132,6 +136,11 @@ class History:
     def insert(self, row):
         code, day = row["code"], row["date"]
         arr = self.bars[code]
+        if day >= TRACKING_START and arr.maxlen is not None:
+            # GitHub runner files are ephemeral; reconstruct complete tracking
+            # history since 2026-10-08, without relying on cache/artifact state.
+            arr = deque(arr)
+            self.bars[code] = arr
         if arr and day < arr[-1]["date"]:
             raise ValueError(f"Data out of chronological order for {code}: {day}")
         if arr and day == arr[-1]["date"]:
@@ -777,7 +786,7 @@ def build_tracking_events(history, market_days, industry_map, start_day):
         volume = pd.to_numeric(df['volume'], errors='coerce')
         dates = df['date'].tolist()
         ordinals = [index_of.get(d) for d in dates]
-        ma = {k: close.rolling(k, min_periods=k).mean() for k in (5, 10, 20, 60, 120)}
+        ma = {k: close.rolling(k, min_periods=k).mean() for k in (5, 10, 20, 30, 60, 120)}
         high60_close = close.shift(1).rolling(60, min_periods=60).max()
         rsi = rsi_wilder(close, 14)
         prev_close = close.shift(1)
@@ -830,6 +839,8 @@ def build_tracking_events(history, market_days, industry_map, start_day):
                 "RSI14": round(float(rsi.iat[i]), 3) if pd.notna(rsi.iat[i]) else None,
                 "MA5": round(float(ma[5].iat[i]), 4),
                 "MA10": round(float(ma[10].iat[i]), 4),
+                "MA30": round(float(ma[30].iat[i]), 4),
+                "MA10/MA30比": round(float(ma[10].iat[i] / ma[30].iat[i]), 5) if float(ma[30].iat[i]) > 0 else None,
                 "MA20": round(float(ma[20].iat[i]), 4),
                 "MA60": round(float(ma[60].iat[i]), 4),
                 "MA120": round(float(ma[120].iat[i]), 4),
@@ -859,10 +870,14 @@ def tracking_replay(history, as_of, industry_map):
     market_days = sorted(d for d in history.all_market_dates if d <= as_of)
     if len(market_days) < 125:
         raise RuntimeError('At least 125 market sessions required for tracking')
-    replay_days = market_days[-min(REPLAY_DAYS, len(market_days) - 121):]
-    if len(replay_days) < 2:
-        raise RuntimeError('Insufficient sessions for daily comparison')
+    # Strict portfolio inception. Never synthesize positions from 2026-10-07
+    # or the rolling-480-day window used in previous versions.
+    replay_days = [d for d in market_days if TRACKING_START <= d <= as_of]
+    if not replay_days:
+        raise RuntimeError(f'No trading sessions on/after {TRACKING_START}; portfolio cannot start')
     first = replay_days[0]
+    if first != TRACKING_START:
+        raise RuntimeError(f'Missing inception trading day {TRACKING_START}; refuse to invent portfolio baseline')
     # Recompute from daily source history (GitHub runner is ephemeral).
     events, quotes_by_day, eligible, industry_count = build_tracking_events(
         history, market_days, industry_map, first)
@@ -871,8 +886,8 @@ def tracking_replay(history, as_of, industry_map):
     daily_snapshots, daily_changes, trades = [], [], []
     yesterday_active_rows, latest_active_rows = [], []
     latest_new, latest_exit, latest_blocked = [], [], []
-    prev_day = market_days[-2]
-    latest_day = market_days[-1]
+    prev_day = replay_days[-2] if len(replay_days) > 1 else None
+    latest_day = replay_days[-1]
 
     for day in replay_days:
         q = quotes_by_day[day]
@@ -885,7 +900,7 @@ def tracking_replay(history, as_of, industry_map):
             if row is None or not row['汰除條件']:
                 continue
             p = active.pop(code)
-            duration_sessions = day_indices[day] - day_indices[p['入選日期']]
+            duration_sessions = day_indices[day] - day_indices[p['入選日期']] + 1
             closed = {**row, "事件": "剔除", "入選日期": p['入選日期'],
                       "入選收盤價": p['入選收盤價'], "入選條件": p['入選條件'],
                       "持續入選交易日數": duration_sessions,
@@ -960,13 +975,13 @@ def tracking_replay(history, as_of, industry_map):
             'added': latest_new, 'removed': latest_exit, 'blocked': latest_blocked,
             'daily_snapshots': daily_snapshots, 'daily_changes': daily_changes,
             'trades': ledger, 'closed_count': len(closed),
-            'data_window_bounded': len(market_days) > len(replay_days) + 121}
+            'data_window_bounded': False}
 
 
 REPORT_COLS = ['日期', '代號', '名稱', '市場', '產業代碼', '產業', '事件',
                '收盤價', '前日收盤價', '當日漲跌幅%', '今日成交量(張)',
                '10日均量(張)', '30日均量(張)', '量比_10日比30日',
-               'RSI14', 'MA5', 'MA10', 'MA20', 'MA60', 'MA120',
+               'RSI14', 'MA5', 'MA10', 'MA30', 'MA10/MA30比', 'MA20', 'MA60', 'MA120',
                '前60日最高收盤價', '符合條件', '符合項目數',
                '汰除條件', '高點至收盤回落%', '開盤至收盤跌幅%',
                '當日量/前日量', '入選日期', '入選收盤價', '入選條件',
@@ -1008,12 +1023,89 @@ def md_rows(lines, rows, with_exit=False):
                      f"{r.get('入選條件','')} |")
 
 
-def write_tracking_reports(outdir, result, missing_years, official_day):
+def ten_session_prices(history, code, as_of, market_days):
+    """Exactly the most recent ten *market* sessions, with gaps preserved.
+
+    Prices earlier than TRACKING_START are permitted ONLY for this chart or
+    technical indicators, never as a portfolio trade or tracking return.
+    """
+    window = [d for d in market_days if d <= as_of][-10:]
+    prices = {b['date']: float(b['close']) for b in history.bars.get(code, [])}
+    return [(d, prices.get(d)) for d in window]
+
+
+def chart_svg(prices, width=168, height=48):
+    """Lightweight no-dependency inline SVG; breaks lines at missing days."""
+    if not prices:
+        return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 168 48" width="168" height="48"><text x="8" y="25" fill="#64748b">無資料</text></svg>'
+    points = [(i, p) for i, (_d,p) in enumerate(prices) if p is not None]
+    if not points:
+        return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 168 48" width="168" height="48"><text x="8" y="25" fill="#64748b">無資料</text></svg>'
+    bottom, top = min(p for _,p in points), max(p for _,p in points)
+    spread = top - bottom
+    margin = max(spread * 0.13, top * 0.002, 0.001)
+    low, high = bottom - margin, top + margin
+    x_at = lambda i: 7 + (width - 14) * i/max(len(prices)-1, 1)
+    y_at = lambda v: 5 + (height - 10) * (high-v)/(high-low)
+    # Use a group for each contiguous run, never connect through a suspended day.
+    runs = []
+    current = []
+    for i,(_d,price) in enumerate(prices):
+        if price is None:
+            if current:
+                runs.append(current)
+                current=[]
+        else:
+            current.append((x_at(i),y_at(price)))
+    if current:
+        runs.append(current)
+    color = '#168a67' if points[-1][1] >= points[0][1] else '#c65c50'
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="最近十個交易日收盤價" viewBox="0 0 {width} {height}" width="{width}" height="{height}">',
+             f'<path d="M6,{height-5} H{width-6}" stroke="#e2e8f0" stroke-width="1"/>']
+    for run in runs:
+        coords=' '.join(f'{x:.2f},{y:.2f}' for x,y in run)
+        if len(run)>1:
+            parts.append(f'<polyline points="{coords}" fill="none" stroke="{color}" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/>')
+        for x,y in run:
+            parts.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="1.7" fill="{color}"/>')
+    parts.append('</svg>')
+    return ''.join(parts)
+
+
+def _safe(x):
+    return html.escape(str(x if x is not None else '—'), quote=True)
+
+
+def _ratio(x):
+    return '—' if x is None or pd.isna(x) else f'{float(x):.3f}×'
+
+
+def _lots(x):
+    return '—' if x is None or pd.isna(x) else f'{float(x):,.0f}'
+
+
+def _rsi(x):
+    return '—' if x is None or pd.isna(x) else f'{float(x):.1f}'
+
+
+def _sort_pnl(rows):
+    return sorted(rows, key=lambda r: (-(r['入選後報酬率%']) if r.get('入選後報酬率%') is not None else float('inf'), r['代號']))
+
+
+def write_tracking_reports(outdir, result, missing_years, official_day, history=None):
+    """Three-section Markdown + self-contained HTML dashboard + CSV backtests.
+
+    HTML charts are inline SVG and work by double-clicking report.html offline;
+    report.md uses small SVG assets relative to its own folder. A GitHub Actions
+    step summary may not resolve artifact-relative images, but its HTML report does.
+    """
     outdir.mkdir(parents=True, exist_ok=True)
     today = result['today']
     yesterday = result['yesterday_rows']
     added, removed, blocked = result['added'], result['removed'], result['blocked']
-    to_csv(today, outdir / 'signals.csv')  # legacy filename; NOW daily ACTIVE list.
+    kept = _sort_pnl([r for r in today if r.get('持續入選交易日數',0)>=2
+                      and r.get('入選後報酬率%') is not None])
+    to_csv(today, outdir / 'signals.csv')
     to_csv(yesterday, outdir / 'yesterday_signals.csv')
     to_csv(added, outdir / 'added.csv')
     to_csv(removed, outdir / 'removed.csv')
@@ -1021,74 +1113,159 @@ def write_tracking_reports(outdir, result, missing_years, official_day):
     to_csv(result['trades'], outdir / 'trades.csv')
     to_csv(result['daily_snapshots'], outdir / 'daily_watchlist.csv')
     to_csv(result['daily_changes'], outdir / 'daily_changes.csv')
+    to_csv(kept, outdir / 'continuous_returns.csv')
+    market_days = sorted(d for d in history.all_market_dates if d <= result['latest']) if history is not None else []
+    trends = {r['代號']: ten_session_prices(history, r['代號'], result['latest'], market_days)
+              for r in today} if history is not None else {}
+    charts = outdir / 'charts'
+    charts.mkdir(exist_ok=True)
+    for code, prices in trends.items():
+        (charts / f'{code}.svg').write_text(chart_svg(prices), encoding='utf-8')
     metadata = {
         'as_of': result['latest'], 'previous_trading_day': result['yesterday'],
-        'replay_start': result['replay_start'], 'industry_pool': result['industry_pool'],
-        'eligible': result['eligible'], 'active_count': len(today),
-        'previous_count': len(yesterday), 'added_count': len(added),
-        'removed_count': len(removed), 'blocked_count': len(blocked),
-        'closed_trades_in_window': result['closed_count'],
+        'tracking_start': TRACKING_START, 'replay_start': result['replay_start'],
+        'industry_pool': result['industry_pool'], 'eligible': result['eligible'],
+        'active_count': len(today), 'previous_count': len(yesterday),
+        'added_count': len(added), 'removed_count': len(removed),
+        'blocked_count': len(blocked), 'continuous_2plus_count': len(kept),
+        'closed_trades_since_start': result['closed_count'],
         'missing_years': missing_years, 'official_snapshot': official_day,
         'price_basis': 'raw_unadjusted_ohlcv',
+        'volume_unit': 'lots (1000 shares)',
+        'price_ma_ratio': 'MA10/MA30 (closing-price SMA, not volume)',
+        'volume_ratio': '10-day/30-day average shares',
         'entry_assumption': 'signal_day_close', 'exit_assumption': 'exit_day_close',
-        'volume_unit': 'lots', 'replay_days': REPLAY_DAYS,
-        'tracking_state': 'reconstructed_from_rolling_history_every_run',
-        'tracking_limitations': ['rolling lookback boundary; entries before replay start not preserved',
-                                 'current company directory; survivorship/industry classification bias',
-                                 'raw unadjusted prices; no dividends/splits/fees/slippage'],
-        'exit_thresholds': {'below_ma10_strict': True, 'upper_drop_pct_gte': UPPER_WICK_DRAWDOWN_PCT,
+        'tracking_state': 'recomputed from 2026-10-08 every run; no prior portfolio records',
+        'tracking_limitations': ['historical data before 2026-10-08 used for technical indicators and 10-session charts only',
+                                 'current company directory; survivorship/industry-classification bias',
+                                 'raw unadjusted prices; no dividends, splits, fees or slippage',
+                                 'signal-day close execution is a hypothetical (non-executable) fill',
+                                 'missing daily OHLCV: mark missing return rather than fabricate'],
+        'exit_thresholds': {'below_ma10_strict': True,
+                            'upper_drop_pct_gte': UPPER_WICK_DRAWDOWN_PCT,
                             'volume_vs_previous_gte': UPPER_WICK_MIN_VOLUME_PREV_MULTIPLIER,
                             'black_body_drop_pct_gte': LONG_BLACK_BODY_PCT,
                             'black_volume_vs_previous_gt': BEARISH_VOLUME_MULTIPLIER},
     }
     (outdir / 'metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
-    lines = [f"# 台股動能名單與理論報酬追蹤 — {result['latest']}", '',
-             f"- 今日 {result['latest']}：**{len(today)} 檔**；昨日 {result['yesterday']}：**{len(yesterday)} 檔**",
-             f"- **新增 {len(added)}、汰除 {len(removed)}、同日被阻擋 {len(blocked)}**",
-             f"- 可評估產業股票：{result['industry_pool']}；有連續 120 日資料：{result['eligible']}",
-             f"- 追蹤回放範圍：**{result['replay_start']} 至 {result['latest']}**，每次執行重新推算，並非永久資料庫。",
-             '- 進場：必要條件與 C1～C4 任一訊號成立，且當日無汰除條件；入選日收盤價為理論進場價。',
-             '- 持續持有：不要求每天重新觸發 C1～C4；直到 E1～E3 任一汰除條件成立才移除。',
-             '- E1：收盤 < MA10。',
-             '- E2：當日量 ≥ 昨日量 × 55%，且（最高價−收盤價）／最高價 ≥ 7%。',
-             f'- E3：當日量 > 昨日量 × {BEARISH_VOLUME_MULTIPLIER:g}，且（開盤價−收盤價）／開盤價 ≥ {LONG_BLACK_BODY_PCT:g}%。',
-             '- 收盤相對前一交易日收盤價的漲跌幅，與入選至當日或汰除日的累積報酬，是兩個不同指標。',
-             '- 資料價格 **未還原**，含除權息、拆股造成的價格不連續；報酬不含股利、手續費、稅費與滑價。',
-             '- 同日收盤確認訊號並假設同日收盤成交有可執行性偏差；回測時需考慮次日開盤成交。',
-             '- 歷史追蹤受回放起點與當前公司名冊限制，未涵蓋已下市公司；**不可視為無偏完整歷史回測**。',
-             f"- 官方近期資料更新：{official_day or '僅來源封存'}；歷史缺漏年份：{missing_years or '無'}。", '']
-    lines += ['## 本日名單（含當日漲跌幅）', '']
-    md_rows(lines, today)
-    lines += ['', '## 前一交易日名單（含該日漲跌幅）', '']
-    md_rows(lines, yesterday)
-    lines += ['', '## 今日新增', '']
-    md_rows(lines, added)
-    lines += ['', '## 今日汰除及理論累積報酬', '']
-    md_rows(lines, removed, with_exit=True)
-    lines += ['', '## 當日符合進場訊號但同時觸發汰除（未入選）', '']
-    if blocked:
-        lines += ['| 代號 | 名稱 | 收盤價 | 當日漲跌幅 | C | E |',
-                  '|---|---|---:|---:|---|---|']
-        for r in blocked:
-            lines.append(f"| {r['代號']} | {r['名稱']} | {fprice(r['收盤價'])} | "
-                         f"{pct(r['當日漲跌幅%'])} | {r['符合條件']} | {r['汰除條件']} |")
+
+    preface = [f'# 台股動能觀察報告｜{result["latest"]}', '',
+               f'資料截止日：**{result["latest"]}**；追蹤起點：**{TRACKING_START}**；'
+               f'昨日：**{result["yesterday"] or "起始日，無前一日清單"}**。',
+               f'觀察 **{len(today)}** 檔；新增 **{len(added)}** 檔；'
+               f'剔除 **{len(removed)}** 檔；連續追蹤至少 2 交易日 **{len(kept)}** 檔。',
+               '原始（未還原）日線；僅從 2026/10/08 計算名單和收益。'
+               '10 日圖可能包含起點之前的價位作為技術參考。', '']
+    summary = preface + ['## 一、觀察清單', '',
+        '「觸發條件」為當次**首次入選**的 C1～C4；未汰除即繼續留在觀察名單。'
+        'MA10/MA30 為收盤價均線比；另列 10 日／30 日**成交均量比**。', '']
+    summary += ['| 代號 | 名稱 | 產業 | 收盤價 | 當日量(張) | MA10/MA30(價) | 10/30日均量比 | RSI14 | 入選觸發 | 今日漲跌幅 | 近10日收盤價走勢 |',
+                '|---|---|---|---:|---:|---:|---:|---:|---|---:|---|']
+    for r in today:
+        code=r['代號']
+        spark=f'![{code}走勢](charts/{code}.svg)' if code in trends else '—'
+        summary.append(f'| {code} | {r.get("名稱","")} | {r.get("產業", "—")} | '
+                       f'{fprice(r.get("收盤價"))} | {_lots(r.get("今日成交量(張)"))} | '
+                       f'{_ratio(r.get("MA10/MA30比"))} | {_ratio(r.get("量比_10日比30日"))} | '
+                       f'{_rsi(r.get("RSI14"))} | C{str(r.get("入選條件", "")).replace(",", ", C")} | '
+                       f'{pct(r.get("當日漲跌幅%"))} | {spark} |')
+    if not today:
+        summary.append('| — | 無符合或持續追蹤標的 | — | — | — | — | — | — | — | — | — |')
+    summary += ['', '## 二、新增、剔除清單', '',
+                f'**今日新增：{len(added)} 檔**（當日出現 C1～C4，且未觸發 E1～E3）', '']
+    if added:
+        summary += ['| 代號 | 名稱 | 收盤價 | 當日漲跌幅 | 入選訊號 |', '|---|---|---:|---:|---|']
+        for r in added:
+            summary.append(f'| {r["代號"]} | {r["名稱"]} | {fprice(r.get("收盤價"))} | '
+                           f'{pct(r.get("當日漲跌幅%"))} | C{r.get("符合條件", "").replace(",", ", C")} |')
     else:
-        lines.append('（無）')
-    lines += ['', '## 回測資料檔案', '',
-              '- `signals.csv`：今日**持續追蹤**名單（包含新入選及持有中的股票）。',
-              '- `yesterday_signals.csv`：昨日持續追蹤名單。',
-              '- `added.csv`、`removed.csv`：今日新增／汰除及退出理由。',
-              '- `blocked_entries.csv`：符合入選條件但同日已觸發汰除者。',
-              '- `trades.csv`：歷史已結束追蹤及目前持續追蹤部位，含進出場日期、價格與理論報酬。',
-              '- `daily_watchlist.csv`：回放期間每日名單、每日漲跌幅及當日累積報酬。',
-              '- `daily_changes.csv`：回放期間每日新增、剔除、同日阻擋事件。', '']
-    content = '\n'.join(lines) + '\n'
-    (outdir / 'report.md').write_text(content, encoding='utf-8')
-    print(f"As-of {result['latest']}, active {len(today)}, yesterday {len(yesterday)}, "
-          f"added {len(added)}, removed {len(removed)}, blocked {len(blocked)}", flush=True)
-    print(f"Saved {outdir/'report.md'}, {outdir/'signals.csv'}, {outdir/'trades.csv'}", flush=True)
+        summary.append('（無）')
+    summary += ['', f'**今日剔除：{len(removed)} 檔**（出現 E1～E3 任一條件）', '']
+    if removed:
+        summary += ['| 代號 | 名稱 | 汰除價 | 當日漲跌幅 | 汰除原因 | 入選日 | 入選至汰除報酬 |',
+                    '|---|---|---:|---:|---|---|---:|']
+        for r in removed:
+            summary.append(f'| {r["代號"]} | {r["名稱"]} | {fprice(r.get("收盤價"))} | '
+                           f'{pct(r.get("當日漲跌幅%"))} | E{r.get("汰除條件", "").replace(",", ", E")} | '
+                           f'{r.get("入選日期", "")} | {pct(r.get("入選後報酬率%"))} |')
+    else:
+        summary.append('（無）')
+    if blocked:
+        summary += ['', f'同日觸發入選與汰除，因此**未入選**：{len(blocked)} 檔（詳 `blocked_entries.csv`）。']
+    summary += ['', '## 三、連續收益', '',
+                '只列當日仍在觀察清單、**包含入選當日在內已追蹤至少 2 個交易日**的股票；'
+                '以入選當日收盤價為理論基準，按累積報酬率由高至低排序。', '']
+    if kept:
+        summary += ['| 排名 | 代號 | 名稱 | 入選日 | 持續交易日 | 入選收盤價 | 今日收盤價 | 累積漲跌幅 |',
+                    '|---:|---|---|---|---:|---:|---:|---:|']
+        for rank,r in enumerate(kept,1):
+            summary.append(f'| {rank} | {r["代號"]} | {r["名稱"]} | {r["入選日期"]} | '
+                           f'{r["持續入選交易日數"]} | {fprice(r.get("入選收盤價"))} | '
+                           f'{fprice(r.get("收盤價"))} | {pct(r.get("入選後報酬率%"))} |')
+    else:
+        summary.append('（尚無追蹤滿兩交易日且有當日行情的股票）')
+    summary += ['', '---',
+                f'資料來源：第三方 GitHub TWSE/TPEx 歷史行情封存及交易所官方近期行情、公司名冊；'
+                f'近期官方更新：{official_day or "未使用"}；歷史封存缺漏年份：{missing_years or "無"}。',
+                f'產業範圍內 {result["industry_pool"]} 檔，有完整連續 120 交易日資料 {result["eligible"]} 檔。',
+                'E1 收盤價<MA10；E2 當日量≥昨日55%且最高價至收盤回落≥7%；'
+                'E3 今日量>昨日量且開盤至收盤跌幅≥5%。',
+                '價格未還原，累積漲跌幅不含股利、除權息調整、交易成本；'
+                '同日收盤產生訊號並以該收盤價模擬進出場，僅供觀察和研究，不等於可成交績效。']
+    content='\n'.join(summary)+'\n'
+    (outdir/'report.md').write_text(content, encoding='utf-8')
+
+    # An offline-openable HTML dashboard, with no JS or external dependencies.
+    styles="""body{font-family:-apple-system,BlinkMacSystemFont,"Noto Sans TC","Microsoft JhengHei",Arial,sans-serif;background:#f5f7fb;color:#17253a;margin:0}main{max-width:1500px;margin:0 auto;padding:30px 20px 55px}header{margin-bottom:24px}h1{font-size:26px;margin:0 0 8px}h2{font-size:22px;margin:0 0 18px}h3{font-size:16px;margin:22px 0 12px}.sub{color:#63748a;font-size:14px;line-height:1.8}.stats{display:flex;gap:12px;flex-wrap:wrap;margin-top:16px}.stat{background:white;border:1px solid #e3e8ef;border-radius:12px;padding:14px 20px;min-width:118px}.stat b{display:block;font-size:23px}.stat span{font-size:12px;color:#63748a}.panel{background:white;border:1px solid #e3e8ef;border-radius:15px;padding:22px;margin:20px 0;box-shadow:0 1px 3px #18364f12}.tablewrap{overflow-x:auto}table{width:100%;border-collapse:collapse;white-space:nowrap;font-size:13px}th{text-align:left;background:#f3f6fa;color:#5a6b80;font-size:12px;position:sticky;top:0}th,td{padding:11px 10px;border-bottom:1px solid #ebeff4}tr:last-child td{border-bottom:0}.num{text-align:right;font-variant-numeric:tabular-nums}.up{color:#078461;font-weight:600}.down{color:#cd4453;font-weight:600}.muted{color:#8291a3}.pill{border-radius:6px;background:#eaf0fb;padding:4px 6px;color:#325997;font-weight:600}.chart{vertical-align:middle}.empty{color:#7a8898;padding:14px 2px}.note{margin-top:18px;font-size:12px;color:#64748b;line-height:1.75}.mini{font-size:12px;color:#6b7a8b;margin-top:8px}footer{color:#64748b;font-size:12px;line-height:1.8;padding:5px 0}@media(max-width:700px){main{padding:16px 10px}.panel{padding:16px 10px}h1{font-size:21px}h2{font-size:19px}}"""
+    def color_pct(x):
+        if x is None or pd.isna(x):
+            return '<span class="muted">—</span>'
+        c = 'up' if float(x)>0 else ('down' if float(x)<0 else 'muted')
+        return f'<span class="{c}">{_safe(pct(x))}</span>'
+    def table(headers, body_rows):
+        if not body_rows:
+            return '<div class="empty">（無）</div>'
+        return '<div class="tablewrap"><table><thead><tr>'+''.join(f'<th>{_safe(h)}</th>' for h in headers)+'</tr></thead><tbody>'+''.join('<tr>'+''.join(f'<td class="{("num" if i in number_cols else "")}">{cell}</td>' for i,cell in enumerate(row))+'</tr>' for row,number_cols in body_rows)+'</tbody></table></div>'
+    watch_rows=[]
+    for r in today:
+        code=r['代號']
+        seq=trends.get(code,[])
+        tooltip='；'.join(f'{d}: {fprice(v)}' for d,v in seq)
+        chart=('<div class="chart" title="'+_safe(tooltip)+'">'+chart_svg(seq)+'</div>') if seq else '—'
+        watch_rows.append(([_safe(code),_safe(r.get('名稱')),_safe(r.get('產業')),
+            _safe(fprice(r.get('收盤價'))),_safe(_lots(r.get('今日成交量(張)'))),
+            _safe(_ratio(r.get('MA10/MA30比'))),_safe(_ratio(r.get('量比_10日比30日'))),
+            _safe(_rsi(r.get('RSI14'))),'<span class="pill">'+_safe('C'+str(r.get('入選條件','')).replace(',', ', C'))+'</span>',
+            color_pct(r.get('當日漲跌幅%')),chart], {3,4,5,6,7,9}))
+    new_rows=[([_safe(r['代號']),_safe(r['名稱']),_safe(fprice(r.get('收盤價'))),
+             color_pct(r.get('當日漲跌幅%')),_safe('C'+r.get('符合條件','').replace(',',', C'))], {2,3}) for r in added]
+    removed_rows=[([_safe(r['代號']),_safe(r['名稱']),_safe(fprice(r.get('收盤價'))),
+                  color_pct(r.get('當日漲跌幅%')),_safe('E'+r.get('汰除條件','').replace(',',', E')),
+                  _safe(r.get('入選日期','')),color_pct(r.get('入選後報酬率%'))], {2,3,6}) for r in removed]
+    profits=[([_safe(rank),_safe(r['代號']),_safe(r['名稱']),_safe(r.get('入選日期')),
+              _safe(r.get('持續入選交易日數')),_safe(fprice(r.get('入選收盤價'))),
+              _safe(fprice(r.get('收盤價'))),color_pct(r.get('入選後報酬率%'))], {0,4,5,6,7}) for rank,r in enumerate(kept,1)]
+    body=[f'<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>台股動能追蹤 {result["latest"]}</title><style>{styles}</style></head><body><main>',
+          '<header><h1>台股動能追蹤儀表板</h1>',f'<div class="sub">資料截止日：{_safe(result["latest"])}　｜　追蹤起點：{TRACKING_START}　｜　前一交易日：{_safe(result["yesterday"] or "無")}</div>',
+          '<div class="stats">'+''.join(f'<div class="stat"><b>{num}</b><span>{label}</span></div>' for num,label in [(len(today),'觀察標的'),(len(added),'今日新增'),(len(removed),'今日剔除'),(len(kept),'追蹤滿2日')])+'</div></header>',
+          '<section class="panel"><h2>一、觀察清單</h2><p class="sub">觸發條件是當次入選時的 C1～C4；折線圖是最近 10 個市場交易日的收盤價。</p>',
+          table(['代號','名稱','產業','收盤價','成交量(張)','MA10/MA30 價比','10/30日均量比','RSI(14)','觸發條件','今日漲跌幅','近10日收盤價'],watch_rows),'</section>',
+          '<section class="panel"><h2>二、新增、剔除清單</h2>',f'<h3>今日新增（{len(added)}）</h3>',
+          table(['代號','名稱','收盤價','今日漲跌幅','入選 C'],new_rows),f'<h3>今日剔除（{len(removed)}）</h3>',
+          table(['代號','名稱','汰除價','今日漲跌幅','汰除 E','原入選日','累積報酬'],removed_rows),
+          f'<p class="mini">同日符合入選與汰除（未納入）：{len(blocked)} 檔，詳 blocked_entries.csv。</p></section>',
+          '<section class="panel"><h2>三、連續收益</h2><p class="sub">僅包含目前仍在觀察清單、連續追蹤至少兩個交易日，且當日有收盤價的標的；依累積漲跌幅降冪排序。</p>',
+          table(['排名','代號','名稱','入選日','追蹤交易日','入選價','今日收盤','累積漲跌幅'],profits),'</section>',
+          '<footer>價格使用原始未還原日線，理論進出場以訊號日收盤價計算，不含股利、手續費、交易稅與滑價。'+
+          f'資料來源：第三方 TWSE／TPEx 封存與交易所官方行情；近期官方更新：{_safe(official_day or "未使用")}；歷史缺漏年份：{_safe(missing_years or "無")}。'+
+          f'範圍內 {result["industry_pool"]} 檔、連續120日資料完整 {result["eligible"]} 檔；獨立研究用途。</footer></main></body></html>']
+    (outdir/'report.html').write_text(''.join(body), encoding='utf-8')
+    print(f'As-of {result["latest"]}, active {len(today)}, added {len(added)}, removed {len(removed)}, 2-day+ {len(kept)}',flush=True)
+    print(f'Saved {outdir/"report.html"}, {outdir/"report.md"}, {outdir/"trades.csv"}',flush=True)
     if os.getenv('GITHUB_STEP_SUMMARY'):
-        with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a', encoding='utf-8') as f:
+        # Github job summaries cannot reliably reference images inside artifacts.
+        # The offline report.html contains fully embedded line charts.
+        with Path(os.environ['GITHUB_STEP_SUMMARY']).open('a',encoding='utf-8') as f:
             f.write(content[:980000])
 
 def main(argv=None):
@@ -1128,7 +1305,7 @@ def main(argv=None):
     industry_map = (industry_map_from_csv(args.industry_csv) if args.industry_csv
                     else industry_map_from_official(session()))
     tracking = tracking_replay(hist, args.as_of, industry_map)
-    write_tracking_reports(args.output, tracking, missing, official)
+    write_tracking_reports(args.output, tracking, missing, official, hist)
 
 
 if __name__ == "__main__":
