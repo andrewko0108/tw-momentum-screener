@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""台股上市/上櫃電子與設備股動能訊號＋追蹤報酬掃描器 v1.5 (2026)
+"""台股上市/上櫃電子與設備股動能訊號＋追蹤報酬掃描器 v1.5.1 (2026)
 使用歸檔歷史日線 + 官方行情 + 官方公司產業代碼；判斷規則見 README.md。
 依賴: pandas, requests。歷史資料源為第三方公開 GitHub 壓縮檔（源於 TWSE/TPEx）。
 """
@@ -71,6 +71,46 @@ def session():
                       "Accept": "application/json, */*"})
     return s
 
+
+
+class TemporarySourceError(RuntimeError):
+    """A data source did not deliver one COMPLETE, parseable JSON response."""
+
+
+def fetch_json_reliably(s, url, *, params=None, timeout=55, label="資料來源", attempts=4):
+    """Retry a WHOLE JSON response, including mid-body ChunkedEncodingError.
+
+    An HTTPAdapter retry alone cannot recover a transfer that dies while
+    requests reads the response body. We retry the idempotent GET from the
+    beginning; an incomplete JSON body is NEVER treated as a partial quote.
+    Fatal HTTP 4xx errors (except 408/429) are reported immediately.
+    """
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            # Close the response even when parsing/reading raises mid-stream.
+            with s.get(url, params=params, timeout=timeout, stream=True,
+                       headers={"Connection": "close", "Cache-Control": "no-cache"}) as response:
+                response.raise_for_status()
+                # .json() reads the ENTIRE response body. Body truncation can
+                # raise ChunkedEncodingError *here*, not at HTTP connect time.
+                return response.json()
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status not in (408, 429, 500, 502, 503, 504):
+                raise RuntimeError(f"{label}: HTTP {status}; API may have changed") from exc
+            last = exc
+        except (requests.exceptions.RequestException, ValueError) as exc:
+            # ValueError includes JSONDecodeError from incomplete/malformed JSON.
+            last = exc
+        if attempt < attempts:
+            wait = min(2 ** (attempt - 1), 6)
+            print(f"[RETRY {attempt}/{attempts}] {label}: {type(last).__name__}: "
+                  f"{str(last)[:160]}; {wait}s later", flush=True)
+            time.sleep(wait)
+    raise TemporarySourceError(
+        f"{label}: failed {attempts} complete JSON fetches "
+        f"({type(last).__name__}: {str(last)[:220]})") from last
 
 def usable_stock(code, name):
     """Only numeric, 4-digit ordinary shares; removes DR and explicitly named preferred shares."""
@@ -241,9 +281,7 @@ def scan_csv(history, path, as_of):
 def download_archives(history, cache_dir, as_of, start_year, force_current=True, archive_end=None):
     cache_dir.mkdir(parents=True, exist_ok=True)
     s = session()
-    resp = s.get(RELEASE_API, timeout=45)
-    resp.raise_for_status()
-    payload = resp.json()
+    payload = fetch_json_reliably(s, RELEASE_API, timeout=45, label="GitHub historical releases")
     assets = {x['name']: x['browser_download_url'] for x in payload.get('assets', [])}
     if not assets:
         raise RuntimeError('GitHub Release has no assets. Check release and permissions.')
@@ -304,9 +342,7 @@ def download_archives(history, cache_dir, as_of, start_year, force_current=True,
 
 
 def official_snapshot(s, url, market):
-    response = s.get(url, timeout=35)
-    response.raise_for_status()
-    raw = response.json()
+    raw = fetch_json_reliably(s, url, timeout=55, label=f"{market} latest quote OpenAPI")
     if not isinstance(raw, list) or not raw:
         raise RuntimeError(f"{market} endpoint returned no list")
     rows = [normalize(r, market) for r in raw]
@@ -323,7 +359,19 @@ def fetch_official_latest_pair():
     """Get aligned latest sessions; OpenAPI TWSE may lag the market close."""
     s = session()
     twse, a = official_snapshot(s, TWSE_API, "上市")
-    tpex, b = official_snapshot(s, TPEX_API, "上櫃")
+    try:
+        tpex, b = official_snapshot(s, TPEX_API, "上櫃")
+    except TemporarySourceError as exc:
+        # Only fall back for transient/partial-download problems; a fully
+        # returned but invalid market snapshot must still fail validation.
+        # The dated endpoint must independently assert its actual trade date.
+        print(f"[FALLBACK] TPEx OpenAPI transport unavailable: {exc}", flush=True)
+        tpex = historical_tpex(s, a)
+        b = a
+        if len(tpex) < 100:
+            raise RuntimeError(f"TPEx dated dailyQuotes {a}: insufficient quotes ({len(tpex)}); "
+                               "refuse partial watchlist")
+        print(f"[FALLBACK OK] TPEx official dated dailyQuotes {b}: {len(tpex)} stocks", flush=True)
     if a < b:
         # TWSE's latest-only OpenAPI can publish later than its dated MI_INDEX.
         twse = historical_twse(s, b)
@@ -345,10 +393,10 @@ def fetch_official_latest_pair():
 def historical_twse(s, day):
     """Official exchange-wide daily OHLCV by date, NOT the latest-only OpenAPI."""
     url = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
-    r = s.get(url, params={"response": "json", "date": day.replace("-", ""),
-                           "type": "ALLBUT0999"}, timeout=45)
-    r.raise_for_status()
-    data = r.json()
+    data = fetch_json_reliably(
+        s, url, params={"response": "json", "date": day.replace("-", ""),
+                        "type": "ALLBUT0999"}, timeout=55,
+        label=f"TWSE historical {day}")
     if not isinstance(data, dict):
         raise RuntimeError(f"TWSE {day}: historical response was not an object")
     if data.get("stat") == "OK":
@@ -388,9 +436,9 @@ def historical_tpex(s, day):
     treating the average PRICE column as trading VOLUME.
     """
     url = "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes"
-    r = s.get(url, params={"response": "json", "date": day.replace("-", "/")}, timeout=45)
-    r.raise_for_status()
-    payload = r.json()
+    payload = fetch_json_reliably(
+        s, url, params={"response": "json", "date": day.replace("-", "/")},
+        timeout=55, label=f"TPEx historical {day}")
     if not isinstance(payload, dict):
         raise RuntimeError(f"TPEx {day}: JSON payload was not an object")
     raw_date = payload.get("date") or payload.get("reportDate")
@@ -528,9 +576,8 @@ def industry_map_from_official(session_obj):
     """Fetch BOTH official company directories; refuse incomplete/unavailable data."""
     output = {}
     for market, url in (("上市", TWSE_PROFILE_API), ("上櫃", TPEX_PROFILE_API)):
-        response = session_obj.get(url, timeout=50)
-        response.raise_for_status()
-        raw = response.json()
+        raw = fetch_json_reliably(
+            session_obj, url, timeout=65, label=f"{market} company directory")
         if not isinstance(raw, list) or len(raw) < 100:
             raise RuntimeError(f"{market}: official company profile data missing/incomplete")
         parsed = dict(filter(None, (parse_industry_row(r, market) for r in raw)))
